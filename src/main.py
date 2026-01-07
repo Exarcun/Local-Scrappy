@@ -2,6 +2,7 @@
 local.ch Scraper - Interactive Console Application
 """
 
+import json
 import os
 import re
 import sys
@@ -13,7 +14,10 @@ from config import (
     DEFAULT_MAX_ERRORS, DEFAULT_DELAY, DEFAULT_PROXY_COOLDOWN
 )
 from db import init_database, get_stats
-from scraper import get_driver, extract_links_paginated
+from scraper import (
+    get_driver, extract_links_paginated,
+    load_links_progress, save_links_progress, delete_links_file
+)
 from proxy import load_proxies, ProxyPool
 from worker import run_workers
 
@@ -39,12 +43,26 @@ def print_banner():
     print("=" * 60)
 
 
+def list_link_files():
+    """List available link files in data/ folder."""
+    if not os.path.exists(DATA_DIR):
+        return []
+
+    link_files = []
+    for f in os.listdir(DATA_DIR):
+        if f.endswith("_links.json"):
+            link_files.append(f)
+
+    return sorted(link_files)
+
+
 def print_main_menu():
     """Print main menu options."""
     print("\n  What would you like to do?")
     print()
     print("    1. Start new scrape")
     print("    2. Run export scripts (on existing database)")
+    print("    3. Resume/continue link extraction")
     print("    0. Exit")
     print()
 
@@ -277,6 +295,39 @@ def run_scrape_mode():
     db_path = get_db_path(db_name)
     print(f"\n  [*] Database: {db_path}")
 
+    # Check for existing links
+    existing_progress = load_links_progress(db_name)
+    links = None
+    start_page = 1
+
+    if existing_progress:
+        print(f"\n  [*] Found existing link data:")
+        print(f"      Links: {existing_progress['link_count']}")
+        print(f"      Pages: {existing_progress['last_page']}/{existing_progress['total_pages']}")
+        print(f"      Status: {'Complete' if existing_progress['completed'] else 'Incomplete'}")
+        print()
+        print("    1. Use existing links (skip extraction)")
+        print("    2. Resume extraction (continue from last page)")
+        print("    3. Start fresh (delete and re-extract)")
+        print()
+
+        choice = prompt_int("Select option", 1, min_val=1, max_val=3)
+
+        if choice == 1:
+            # Use existing links
+            links = existing_progress['links']
+            print(f"\n  [*] Using {len(links)} existing links")
+        elif choice == 2:
+            # Resume from last page
+            start_page = existing_progress['last_page'] + 1
+            links = existing_progress['links']
+            if existing_progress['completed']:
+                print("\n  [*] Link extraction already complete, using existing links")
+        elif choice == 3:
+            # Start fresh
+            delete_links_file(db_name)
+            print("\n  [*] Deleted old link data, starting fresh")
+
     # Step 2: Configuration
     config = prompt_config()
 
@@ -289,6 +340,8 @@ def run_scrape_mode():
     print(f"    Workers: {config['workers']}")
     print(f"    Use proxies: {config['use_proxies']}")
     print(f"    Delay: {config['delay']}s")
+    if links:
+        print(f"    Links: {len(links)} (from file)")
     print("-" * 60)
 
     if not prompt_yes_no("\nProceed with scraping?", default=True):
@@ -307,19 +360,30 @@ def run_scrape_mode():
         status = proxy_pool.status()
         print(f"  [*] Proxy pool: {status['total']} proxies loaded")
 
-    # Step 4: Extract links
-    print(f"\n[Step 4] Extracting links from {config['pages']} pages...")
-    driver = get_driver()  # Use direct connection for link extraction
-    try:
-        links = extract_links_paginated(driver, base_url, config["pages"], delay=config["delay"])
-    finally:
-        driver.quit()
+    # Step 4: Extract links (if not already loaded)
+    if links is None or (existing_progress and not existing_progress['completed'] and start_page > 1):
+        if start_page > 1:
+            print(f"\n[Step 4] Resuming link extraction from page {start_page}...")
+        else:
+            print(f"\n[Step 4] Extracting links from {config['pages']} pages...")
+
+        driver = get_driver()  # Use direct connection for link extraction
+        try:
+            links = extract_links_paginated(
+                driver, base_url, config["pages"],
+                delay=config["delay"],
+                db_name=db_name,
+                start_page=start_page,
+                existing_links=links
+            )
+        finally:
+            driver.quit()
 
     if not links:
         print("\n[!] No links extracted. Check the URL and try again.")
         return
 
-    print(f"\n  [*] Extracted {len(links)} unique links")
+    print(f"\n  [*] Total {len(links)} unique links ready for scraping")
 
     # Step 5: Scrape all data
     print(f"\n[Step 5] Scraping business data...")
@@ -353,13 +417,143 @@ def run_scrape_mode():
     print(f"{'=' * 60}")
 
 
+def run_resume_mode():
+    """Resume or manage link extraction."""
+    link_files = list_link_files()
+
+    if not link_files:
+        print("\n[!] No link files found in data/ folder")
+        print("    Start a new scrape first.")
+        return
+
+    print("\n  Available link files:")
+    for i, lf in enumerate(link_files, 1):
+        lf_path = os.path.join(DATA_DIR, lf)
+        try:
+            with open(lf_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                status = "Complete" if data['completed'] else f"Page {data['last_page']}/{data['total_pages']}"
+                print(f"    {i}. {lf} ({data['link_count']} links, {status})")
+        except:
+            print(f"    {i}. {lf}")
+    print(f"    0. Back to menu")
+
+    choice = prompt_int("Select link file", 0, min_val=0, max_val=len(link_files))
+    if choice == 0:
+        return
+
+    selected_file = link_files[choice - 1]
+    db_name = selected_file.replace('_links.json', '.db')
+
+    progress = load_links_progress(db_name)
+    if not progress:
+        print("\n[!] Error reading link file")
+        return
+
+    print(f"\n  Link file: {selected_file}")
+    print(f"    Base URL: {progress['base_url'][:60]}...")
+    print(f"    Links: {progress['link_count']}")
+    print(f"    Progress: {progress['last_page']}/{progress['total_pages']} pages")
+    print(f"    Status: {'Complete' if progress['completed'] else 'Incomplete'}")
+    print()
+    print("    1. Continue extraction (resume from last page)")
+    print("    2. Go straight to scraping (use current links)")
+    print("    3. Delete this link file")
+    print("    0. Back to menu")
+    print()
+
+    action = prompt_int("Select action", 0, min_val=0, max_val=3)
+
+    if action == 0:
+        return
+    elif action == 1:
+        # Resume extraction
+        if progress['completed']:
+            print("\n[*] Link extraction already complete!")
+            if prompt_yes_no("Proceed to scraping?", default=True):
+                action = 2
+            else:
+                return
+
+        if action == 1:  # Still want to resume
+            start_page = progress['last_page'] + 1
+            print(f"\n[*] Resuming from page {start_page}...")
+
+            driver = get_driver()
+            try:
+                links = extract_links_paginated(
+                    driver, progress['base_url'], progress['total_pages'],
+                    delay=DEFAULT_DELAY,
+                    db_name=db_name,
+                    start_page=start_page,
+                    existing_links=progress['links']
+                )
+                print(f"\n[SUCCESS] Extracted {len(links)} total links")
+            except KeyboardInterrupt:
+                print("\n\n[*] Interrupted - progress saved")
+                return
+            finally:
+                driver.quit()
+
+            if prompt_yes_no("\nProceed to scraping?", default=True):
+                action = 2
+                progress = load_links_progress(db_name)  # Reload with new links
+            else:
+                return
+
+    if action == 2:
+        # Go to scraping
+        db_path = get_db_path(db_name)
+        links = progress['links']
+
+        print(f"\n[*] Starting scrape with {len(links)} links")
+
+        config = prompt_config()
+        init_database(db_path)
+        ensure_output_dir()
+
+        proxy_pool = None
+        if config["use_proxies"]:
+            proxies = load_proxies()
+            proxy_pool = ProxyPool(proxies, cooldown=config.get("cooldown", DEFAULT_PROXY_COOLDOWN))
+            status = proxy_pool.status()
+            print(f"  [*] Proxy pool: {status['total']} proxies loaded")
+
+        print(f"\n[*] Scraping business data...")
+        results = run_workers(links, db_path, proxy_pool, config)
+
+        print(f"\n{'=' * 60}")
+        print("[SUCCESS] Scraping complete!")
+        print(f"{'=' * 60}")
+        print(f"  Time elapsed: {results['elapsed']:.1f}s ({results['elapsed_min']:.1f} min)")
+        print(f"\n  Results:")
+        print(f"    Inserted: {results['inserted']}")
+        print(f"    Skipped:  {results['skipped']}")
+        print(f"    Errors:   {results['errors']}")
+
+        stats = get_stats(db_path)
+        print(f"\n  Database ({db_name}):")
+        print(f"    Total records: {stats['total']}")
+        print(f"    With email:    {stats['with_email']}")
+        print(f"    With website:  {stats['with_website']}")
+        print(f"    With phone:    {stats['with_phone']}")
+
+        prompt_run_scripts(db_path)
+
+    elif action == 3:
+        # Delete link file
+        if prompt_yes_no(f"Delete {selected_file}?", default=False):
+            delete_links_file(db_name)
+            print(f"\n[*] Deleted {selected_file}")
+
+
 def main():
     """Main entry point."""
     print_banner()
     print_main_menu()
 
     while True:
-        choice = prompt_int("Select option", 1, min_val=0, max_val=2)
+        choice = prompt_int("Select option", 1, min_val=0, max_val=3)
 
         if choice == 0:
             print("\n[*] Goodbye!")
@@ -370,6 +564,11 @@ def main():
         elif choice == 2:
             run_export_mode()
             # After export, show menu again
+            print_banner()
+            print_main_menu()
+        elif choice == 3:
+            run_resume_mode()
+            # After resume, show menu again
             print_banner()
             print_main_menu()
 

@@ -2,6 +2,8 @@
 Core scraping functions for local.ch
 """
 
+import json
+import os
 import re
 import time
 from datetime import datetime
@@ -14,8 +16,67 @@ from selenium.webdriver.support import expected_conditions as EC
 
 from config import (
     FIREFOX_PATH, GECKODRIVER_PATH, HEADLESS,
-    PAGE_LOAD_TIMEOUT, ELEMENT_WAIT_TIMEOUT
+    PAGE_LOAD_TIMEOUT, ELEMENT_WAIT_TIMEOUT, DATA_DIR
 )
+
+
+def get_links_file_path(db_name):
+    """Get path to links JSON file for a database."""
+    base_name = db_name.replace('.db', '')
+    return os.path.join(DATA_DIR, f"{base_name}_links.json")
+
+
+def load_links_progress(db_name):
+    """
+    Load links progress from file.
+
+    Returns:
+        Dictionary with progress data or None if not found
+    """
+    links_file = get_links_file_path(db_name)
+    if not os.path.exists(links_file):
+        return None
+
+    try:
+        with open(links_file, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except:
+        return None
+
+
+def save_links_progress(db_name, base_url, total_pages, last_page, links, completed=False):
+    """
+    Save links progress to file.
+
+    Args:
+        db_name: Database name
+        base_url: Base search URL
+        total_pages: Total pages to scrape
+        last_page: Last successfully scraped page
+        links: List of extracted links
+        completed: Whether extraction is complete
+    """
+    links_file = get_links_file_path(db_name)
+
+    data = {
+        "base_url": base_url,
+        "total_pages": total_pages,
+        "last_page": last_page,
+        "completed": completed,
+        "link_count": len(links),
+        "updated_at": datetime.now().isoformat(),
+        "links": links
+    }
+
+    with open(links_file, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2)
+
+
+def delete_links_file(db_name):
+    """Delete links progress file."""
+    links_file = get_links_file_path(db_name)
+    if os.path.exists(links_file):
+        os.remove(links_file)
 
 
 def get_driver(proxy=None):
@@ -114,34 +175,52 @@ def extract_links_from_page(driver, url):
     return links
 
 
-def extract_links_paginated(driver, base_url, num_pages, delay=0.5):
+def extract_links_paginated(driver, base_url, num_pages, delay=0.5, db_name=None, start_page=1, existing_links=None):
     """
-    Extract links from multiple search result pages.
+    Extract links from multiple search result pages with progress saving.
 
     Args:
         driver: WebDriver instance
         base_url: Base search URL
         num_pages: Number of pages to scrape
         delay: Delay between page requests
+        db_name: Database name for saving progress (optional)
+        start_page: Page to start from (for resuming)
+        existing_links: List of already extracted links (for resuming)
 
     Returns:
         List of unique business page URLs
     """
-    all_links = []
+    all_links = list(existing_links) if existing_links else []
 
-    for page in range(1, num_pages + 1):
+    if start_page > 1:
+        print(f"[*] Resuming from page {start_page} ({len(all_links)} links already collected)")
+
+    for page in range(start_page, num_pages + 1):
         if page == 1:
             url = base_url
         else:
             url = f"{base_url}&page={page}"
 
-        page_links = extract_links_from_page(driver, url)
+        try:
+            page_links = extract_links_from_page(driver, url)
 
-        # Add only unique links
-        new_links = [link for link in page_links if link not in all_links]
-        all_links.extend(new_links)
+            # Add only unique links
+            new_links = [link for link in page_links if link not in all_links]
+            all_links.extend(new_links)
 
-        print(f"[*] Page {page}/{num_pages}: {len(page_links)} links ({len(new_links)} new) - Total: {len(all_links)}")
+            print(f"[*] Page {page}/{num_pages}: {len(page_links)} links ({len(new_links)} new) - Total: {len(all_links)}")
+
+            # Save progress after each page
+            if db_name:
+                save_links_progress(db_name, base_url, num_pages, page, all_links, completed=(page == num_pages))
+
+        except Exception as e:
+            print(f"[!] Error on page {page}: {e}")
+            # Save progress even on error
+            if db_name:
+                save_links_progress(db_name, base_url, num_pages, page - 1, all_links, completed=False)
+            raise
 
         if page < num_pages:
             time.sleep(delay)
