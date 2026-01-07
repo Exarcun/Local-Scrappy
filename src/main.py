@@ -8,7 +8,7 @@ import sys
 from urllib.parse import urlparse, unquote
 
 from config import (
-    has_proxy_file, ensure_output_dir, get_db_path, BASE_DIR,
+    has_proxy_file, ensure_output_dir, get_db_path, BASE_DIR, DATA_DIR,
     DEFAULT_PAGES, DEFAULT_WORKERS, DEFAULT_WORKERS_NO_PROXY,
     DEFAULT_MAX_ERRORS, DEFAULT_DELAY, DEFAULT_PROXY_COOLDOWN
 )
@@ -18,12 +18,35 @@ from proxy import load_proxies, ProxyPool
 from worker import run_workers
 
 
+def list_databases():
+    """List available databases in data/ folder."""
+    if not os.path.exists(DATA_DIR):
+        return []
+
+    databases = []
+    for f in os.listdir(DATA_DIR):
+        if f.endswith(".db"):
+            databases.append(f)
+
+    return sorted(databases)
+
+
 def print_banner():
     """Print application banner."""
     print("=" * 60)
     print("  local.ch Scraper v1.0")
     print("  Business data extraction tool")
     print("=" * 60)
+
+
+def print_main_menu():
+    """Print main menu options."""
+    print("\n  What would you like to do?")
+    print()
+    print("    1. Start new scrape")
+    print("    2. Run export scripts (on existing database)")
+    print("    0. Exit")
+    print()
 
 
 def derive_db_name(url):
@@ -169,7 +192,7 @@ def run_script(script_name, db_path):
         print(f"  [!] Script not found: {script_path}")
 
 
-def prompt_run_scripts(db_path):
+def prompt_run_scripts(db_path, standalone=False):
     """Prompt user to run post-processing scripts."""
     scripts = list_scripts()
 
@@ -177,7 +200,11 @@ def prompt_run_scripts(db_path):
         print("\n[*] No scripts found in scripts/ folder")
         return
 
-    print("\n[Step 5] Post-processing scripts")
+    if standalone:
+        print("\n  Export Scripts")
+    else:
+        print("\n[Step 5] Post-processing scripts")
+
     print("  Available scripts:")
     for i, script in enumerate(scripts, 1):
         print(f"    {i}. {script}")
@@ -193,10 +220,57 @@ def prompt_run_scripts(db_path):
             return
 
 
-def main():
-    """Main entry point."""
-    print_banner()
+def prompt_select_database():
+    """Prompt user to select an existing database."""
+    databases = list_databases()
 
+    if not databases:
+        print("\n[!] No databases found in data/ folder")
+        print("    Run a scrape first to create a database.")
+        return None
+
+    print("\n  Available databases:")
+    for i, db in enumerate(databases, 1):
+        db_path = os.path.join(DATA_DIR, db)
+        try:
+            stats = get_stats(db_path)
+            print(f"    {i}. {db} ({stats['total']} records)")
+        except:
+            print(f"    {i}. {db}")
+    print(f"    0. Back to menu")
+
+    choice = prompt_int("Select database", 0, min_val=0, max_val=len(databases))
+    if choice == 0:
+        return None
+
+    return os.path.join(DATA_DIR, databases[choice - 1])
+
+
+def run_export_mode():
+    """Run export scripts on existing database."""
+    db_path = prompt_select_database()
+    if not db_path:
+        return
+
+    # Show database stats
+    try:
+        stats = get_stats(db_path)
+        db_name = os.path.basename(db_path)
+        print(f"\n  Database: {db_name}")
+        print(f"    Total records: {stats['total']}")
+        print(f"    With email:    {stats['with_email']}")
+        print(f"    With website:  {stats['with_website']}")
+        print(f"    With phone:    {stats['with_phone']}")
+    except Exception as e:
+        print(f"\n[!] Error reading database: {e}")
+        return
+
+    # Run export scripts
+    prompt_run_scripts(db_path, standalone=True)
+
+
+def run_scrape_mode():
+    """Run full scraping workflow."""
     # Step 1: Get base URL
     base_url = prompt_url()
     db_name = derive_db_name(base_url)
@@ -277,6 +351,27 @@ def main():
     print(f"\n{'=' * 60}")
     print("[*] Done!")
     print(f"{'=' * 60}")
+
+
+def main():
+    """Main entry point."""
+    print_banner()
+    print_main_menu()
+
+    while True:
+        choice = prompt_int("Select option", 1, min_val=0, max_val=2)
+
+        if choice == 0:
+            print("\n[*] Goodbye!")
+            return
+        elif choice == 1:
+            run_scrape_mode()
+            return
+        elif choice == 2:
+            run_export_mode()
+            # After export, show menu again
+            print_banner()
+            print_main_menu()
 
 
 if __name__ == "__main__":
